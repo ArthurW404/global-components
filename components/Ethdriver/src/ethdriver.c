@@ -29,6 +29,11 @@
 
 static struct eth_driver *eth_driver;
 
+#ifdef CONFIG_ARM_SMMU
+seL4_CPtr camkes_get_smmu_cb_cap();
+seL4_CPtr camkes_get_smmu_sid_cap();
+#endif
+
 
 /*
  *Struct eth_buf contains a virtual address (buf) to use for memory operations
@@ -108,8 +113,8 @@ static int done_init = 0;
 void client_emit(unsigned int client_id);
 unsigned int client_get_sender_id(void);
 unsigned int client_num_badges(void);
-unsigned int client_enumerate_badge(unsigned int i);
-void *client_buf(unsigned int client_id);
+seL4_Word client_enumerate_badge(unsigned int i);
+void *client_buf(seL4_Word client_id);
 bool client_has_mac(unsigned int client_id);
 void client_get_mac(unsigned int client_id, uint8_t *mac);
 
@@ -251,6 +256,26 @@ error:
     }
 }
 
+static char
+hexchar(unsigned int v)
+{
+    return v < 10 ? '0' + v : ('a' - 10) + v;
+}
+
+static void
+dump_packet(void *packet_ptr, int len)
+{
+    uint8_t *packet = (uint8_t *) packet_ptr;
+    for (unsigned i = 0; i < len; i++) {
+        putchar(hexchar((packet[i] >> 4) & 0xf));
+        putchar(hexchar(packet[i] & 0xf));
+        if (i < len - 1) {
+            putchar(' ');
+        }
+    } 
+    printf("\n");
+}
+
 static struct raw_iface_callbacks ethdriver_callbacks = {
     .tx_complete = eth_tx_complete,
     .rx_complete = eth_rx_complete,
@@ -287,6 +312,10 @@ int client_rx(int *len)
     client->pending_rx_tail = (client->pending_rx_tail + 1) % CLIENT_RX_BUFS;
     memcpy(packet, rx.buf->buf, rx.len);
     *len = rx.len;
+
+    printf("|client_rx| rx.buf->buf =");
+    dump_packet(rx.buf->buf, rx.len);
+
     if (client->pending_rx_tail == client->pending_rx_head) {
         client->should_notify = 1;
         ret = 0;
@@ -300,6 +329,7 @@ int client_rx(int *len)
 
 int client_tx(int len)
 {
+    // printf("|client_tx| called\n");
     if (!done_init) {
         return -1;
     }
@@ -328,9 +358,26 @@ int client_tx(int len)
             ((char *)(tx_buf->buf.buf + 6))[i] = ((char *)client->mac)[i];
         }
 
+        printf("|client_tx| tx_buf->buf.buf = ");
+        dump_packet(tx_buf->buf.buf, len);
+        
         /* queue up transmit */
+#ifdef CONFIG_ARM_SMMU
+        err = eth_driver->i_fn.raw_tx(eth_driver, 1, (uintptr_t *) & (tx_buf->buf.buf),
+                                             (unsigned int *)&len, tx_buf);
+#else 
         err = eth_driver->i_fn.raw_tx(eth_driver, 1, (uintptr_t *) & (tx_buf->buf.phys),
                                       (unsigned int *)&len, tx_buf);
+#endif       
+
+#ifdef CONFIG_ARM_SMMU
+        for (int i = 0; i < 100000; ++i) {}
+        seL4_CPtr cb_cap = camkes_get_smmu_cb_cap();
+
+        seL4_ARM_CB_CBGetFault_t cb_fault = seL4_ARM_CB_CBGetFault(cb_cap);
+        printf("|eth server init|Fault addr = 0x%lx status = %lx\n", cb_fault.address, cb_fault.status);
+#endif /* CONFIG_ARM_SMMU */
+
         if (err != ETHIF_TX_ENQUEUED) {
             /* Free the internal tx buffer in case tx fails. Up to the client to retry the trasmission */
             client->num_tx++;
@@ -371,19 +418,53 @@ int server_init(ps_io_ops_t *io_ops)
         ZF_LOGF("Unable to find an ethernet device");
     }
 
-
     eth_driver->cb_cookie = NULL;
     eth_driver->i_cb = ethdriver_callbacks;
 
+#ifdef CONFIG_ARM_SMMU
+    /* configure the smmu */
+    printf("===> pre cap\n");
+    ZF_LOGD("Getting sid and cb caps");
+    seL4_CPtr cb_cap = camkes_get_smmu_cb_cap();
+    seL4_CPtr sid_cap = camkes_get_smmu_sid_cap();
+    printf("cb_cap = %d\n", cb_cap);
+    printf("===> post cap\n");
+
+    ZF_LOGD("Assigning vspace to context bank");
+
+    // PGD_CAP in capdl_spec.c (seems correct since other numbers fault)
+    int err;
+    err = seL4_ARM_CB_AssignVspace(cb_cap, 536);
+    printf("|seL4_ARM_CB_AssignVspace|err = %d\n", err);
+
+    ZF_LOGF_IF(err, "Failed to assign vspace to CB");
+
+    ZF_LOGD("Binding stream id to context bank");
+    err = seL4_ARM_SID_BindCB(sid_cap, cb_cap);
+    printf("|seL4_ARM_SID_BindCB|err = %d\n", err);
+    ZF_LOGF_IF(err, "Failed to bind CB to SID");
+
+    seL4_ARM_CB_CBGetFault_t cb_fault = seL4_ARM_CB_CBGetFault(cb_cap);
+    printf("|eth server init|Fault addr = 0x%lx status = %lx\n", cb_fault.address, cb_fault.status);
+
+#endif /* CONFIG_ARM_SMMU */
 
     /* preallocate buffers */
     for (int i = 0; i < RX_BUFS; i++) {
         void *buf = ps_dma_alloc(&io_ops->dma_manager, BUF_SIZE, 4, 1, PS_MEM_NORMAL);
+        if (!buf) {
+            buf = ps_dma_alloc(&io_ops->dma_manager, BUF_SIZE, 4, 0, PS_MEM_NORMAL);
+        }
         assert(buf);
         memset(buf, 0, BUF_SIZE);
         uintptr_t phys = ps_dma_pin(&io_ops->dma_manager, buf, BUF_SIZE);
         rx_bufs[num_rx_bufs] = (eth_buf_t) {
-            .buf = buf, .phys = phys
+            .buf = buf, 
+            #ifdef CONFIG_ARM_SMMU
+            .phys = (uintptr_t)buf
+            #else 
+            .phys = phys
+            #endif 
         };
         rx_buf_pool[num_rx_bufs] = &(rx_bufs[num_rx_bufs]);
         num_rx_bufs++;
@@ -396,6 +477,9 @@ int server_init(ps_io_ops_t *io_ops)
         clients[client].dataport = client_buf(clients[client].client_id);
         for (int i = 0; i < CLIENT_TX_BUFS; i++) {
             void *buf = ps_dma_alloc(&io_ops->dma_manager, BUF_SIZE, 4, 1, PS_MEM_NORMAL);
+            if (!buf) {
+                buf = ps_dma_alloc(&io_ops->dma_manager, BUF_SIZE, 4, 0, PS_MEM_NORMAL);
+            }
             assert(buf);
             memset(buf, 0, BUF_SIZE);
             uintptr_t phys = ps_dma_pin(&io_ops->dma_manager, buf, BUF_SIZE);
@@ -404,7 +488,12 @@ int server_init(ps_io_ops_t *io_ops)
                 .len = BUF_SIZE, .client = client
             };
             tx_buf->buf = (eth_buf_t) {
-                .buf = buf, .phys = phys
+                .buf = buf, 
+                #ifdef CONFIG_ARM_SMMU
+                .phys = (uintptr_t)buf
+                #else 
+                .phys = phys
+                #endif 
             };
             clients[client].pending_tx[clients[client].num_tx] = tx_buf;
             clients[client].num_tx++;
